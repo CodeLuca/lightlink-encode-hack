@@ -8,6 +8,12 @@ import PlayerState from './components/PlayerState';
 import Controls from './components/Controls';
 import LoginControls from './components/LoginControls';
 
+const shortenAddress = (address, charsToShow = 6, breakChar = '...') => {
+  const front = address.substring(0, charsToShow);
+  const back = address.substring(address.length - charsToShow);
+  return `${front}${breakChar}${back}`;
+};
+
 const GameStateEnum = {
   Joining: 0,
   Player1Bet: 1,
@@ -30,8 +36,11 @@ const App = () => {
   const [isPlayer1, setIsPlayer1] = useState(false);
   const [isPlayer2, setIsPlayer2] = useState(false);
   const [isMyTurn, setIsMyTurn] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [confirmed, setConfirmed] = useState(null);
 
-  const contractAddress = '0x9c0999d9843B7A2A06eCd848692ADA6050451008';
+  const contractAddress = '0x186807C9aAC89237e75306aD80430395Cce4Ca25';
   const contractABI = abi;
   const { moon } = useMoonSDK();
   const web3 = new Web3(window.ethereum);
@@ -49,6 +58,7 @@ const App = () => {
       [GameStateEnum.Player1RollDice]: 'Player 1 Roll Dice',
       [GameStateEnum.Player2RollDice]: 'Player 2 Roll Dice',
       [GameStateEnum.DetermineWinner]: 'Determine Winner',
+      [GameStateEnum.Tie]: 'Tie',
       [GameStateEnum.GameEnded]: 'Game Ended',
     };
 
@@ -63,41 +73,25 @@ const App = () => {
   }, [moon]);
 
   useEffect(() => {
-    if (accounts && accounts[0]) {
-      getGameState();
-    }
-  }, [accounts]);
+    let intervalId;
 
-  useEffect(() => {
-    let subscription;
+    const fetchGameState = async () => {
+      if (accounts && accounts[0]) {
+        await getGameState();
+      }
+    };
 
-    if (web3) {
-      web3.eth.subscribe('newBlockHeaders', (error, result) => {
-        if (!error) {
-          getGameState();
-        }
-      })
-        .then(sub => {
-          subscription = sub;
-        })
-        .catch(console.error);
-    }
+    fetchGameState(); // Fetch the game state immediately
+
+    intervalId = setInterval(fetchGameState, 10000); // Fetch the game state every 5 seconds
 
     // Cleanup function
     return () => {
-      if (subscription) {
-        // Unsubscribe when the component is unmounted
-        subscription.unsubscribe((error, success) => {
-          if (success) {
-            console.log('Successfully unsubscribed!');
-          } else {
-            console.error('Failed to unsubscribe:', error);
-          }
-        });
+      if (intervalId) {
+        clearInterval(intervalId); // Clear the interval when the component is unmounted
       }
     };
-  }, [web3, accounts, contract]); // Dependencies
-
+  }, [accounts]);
 
   const getAccounts = async () => {
     try {
@@ -106,6 +100,8 @@ const App = () => {
     } catch (error) {
       console.error("Error fetching accounts:", error);
       moon.logout();
+      setLoggedIn(false);
+      setError("Error fetching accounts");
     }
   };
 
@@ -118,7 +114,7 @@ const App = () => {
     }
   };
 
-  const callContractMethod = async (methodName, args = []) => {
+  const callContractMethod = async (methodName, args = [], convertToBigInt = false) => {
     if (!contract) {
       console.error('Contract is not initialized');
       return;
@@ -132,13 +128,14 @@ const App = () => {
       }
 
       const result = await method(...args).call({ from: accounts[0] });
-      return web3.utils.toBigInt(result).toString();
+      return convertToBigInt ? web3.utils.toBigInt(result).toString() : result;
     } catch (error) {
-      console.error(`Error calling ${methodName} method:`, error);
+      console.error(`Error calling ${methodName} method:`, error, args);
     }
   };
 
   const sendTransaction = async (methodName, args = [], transactionOptions = {}) => {
+    setLoading(true);
     if (!contract) {
       console.error('Contract is not initialized');
       return;
@@ -173,70 +170,99 @@ const App = () => {
         rawTransaction,
       });
 
+      setConfirmed(`Transaction sent successfully for ${methodName}`)
+      console.log({ result })
+
+      setLoading(false);
       return result;
     } catch (error) {
       console.error(`Error sending transaction to ${methodName} method:`, error);
+      setError(`Error sending transaction to ${methodName} method (${JSON.stringify(error)})`);
+      setLoading(false);
     }
   };
 
   const getGameState = async () => {
-    const currentBet = await callContractMethod('currentBet');
+    console.log('Getting game state...');
+    const currentBet = await callContractMethod('currentBet', [], true);
     const player2 = await callContractMethod('player2');
     const player1 = await callContractMethod('player1');
     const winner = await callContractMethod('winner');
     const currentBettor = await callContractMethod('currentBettor');
-    const gS = await callContractMethod('currentState');
+    const gS = await callContractMethod('currentState', [], true);
+    let diceStates = await callContractMethod('getPlayersDice');
 
-    setIsPlayer1(accounts[0] === player1);
-    setIsPlayer2(accounts[0] === player2);
-    setIsMyTurn(accounts[0] === currentBettor);
+    diceStates = [
+      diceStates[0].map(dice => Number(dice)),
+      diceStates[1].map(dice => Number(dice)),
+    ]
+
+    setIsPlayer1(accounts[0] === player1.toLowerCase());
+    setIsPlayer2(accounts[0] === player2.toLowerCase());
+
+    // setIsMyTurn(currentBettor.toLowerCase() === accounts[0].toLowerCase());
+    if ((Number(gS) === GameStateEnum.Player1Bet && isPlayer1) || (Number(gS) === GameStateEnum.Player2BetOrCall && isPlayer2)) {
+      setIsMyTurn(true);
+    }
+    if ((Number(gS) === GameStateEnum.Player1RaiseOrCall && isPlayer1) || (Number(gS) === GameStateEnum.Player2RaiseOrCall && isPlayer2)) {
+      setIsMyTurn(true);
+    }
+    if ((Number(gS) === GameStateEnum.Player1RollDice && isPlayer1) || (Number(gS) === GameStateEnum.Player2RollDice && isPlayer2)) {
+      setIsMyTurn(true);
+    }
+    console.log(Number(gS), GameStateEnum.Player1RollDice)
+    console.log(Number(gS), GameStateEnum.Player2RollDice)
     setGameData({
       currentBet, player2, player1, winner,
-      currentBettor
+      currentBettor, diceStates
     });
 
     setGameState(gS);
+    console.log({ gameData })
   };
 
   const gameStateInWords = getGameStateInWords(gameState);
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 text-gray-900 px-4">
+      {error && <div className="mb-5 bg-red-800 rounded text-white p-2 px-4">{error}</div>}
+      {confirmed && <div className="mb-2 text-black p-2 px-4">{confirmed}</div>}
+      {loading && <div className="mb-10 bg-gray-800 rounded text-white p-2 px-4 text-center">Loading...</div>}
       {!loggedIn && (
         <>
           <LoginControls />
-          <Link to="/signup" className="mt-4">
-            <button className="py-2 px-4 bg-green-600 text-white rounded-md hover:bg-green-500">Signup</button>
-          </Link>
         </>
       )}
       {loggedIn && (
-        <div className="max-w-6xl">
-          {!accounts && <p>Loading...</p>}
+        <div className="w-full max-w-5xl">
+          <h2 className="font-bold text-center text-4xl mb-4 w-full">
+            LightLink Dice Poker
+          </h2>
+          {!accounts && <p className="text-center w-full">Loading...</p>}
           {accounts && !accounts[0] && (
             <button onClick={createWallet} className="mt-4 py-2 px-4 bg-indigo-600 text-white rounded-md hover:bg-indigo-500">Create a Wallet</button>
           )}
           {accounts && accounts[0] &&
-            <div className="mt-4 text-sm font-semibold mb-4">Logged in as: {accounts[0]}</div>
+            <div className="mt-4 text-xs mb-6 -mt-2 text-center">Logged in as: {accounts[0]}</div>
           }
           {gameData && (
             <>
               <div className="w-full bg-white p-6 rounded-lg shadow-lg mb-4">
-                <GameState currentPot={gameData.currentBet} gameState={gameStateInWords} />
+                <GameState currentPot={gameData.currentBet} gameData={gameData} gameState={gameStateInWords} />
               </div>
               <div className="w-full flex justify-between mb-4 gap-4">
                 {accounts && accounts[0] &&
                   <div className="w-1/2 bg-white p-6 rounded-lg shadow-lg">
-                    <PlayerState address={accounts[0]} diceState={gameData.player1} />
+                    <PlayerState playerNumber={1} address={gameData.player1} isPlayer={isPlayer1} diceState={gameData.diceStates[0]} />
                   </div>
                 }
                 {accounts &&
                   <div className="w-1/2 bg-white p-6 rounded-lg shadow-lg">
-                    <PlayerState address={accounts[1]} diceState={gameData.player2} />
+                    <PlayerState playerNumber={2} address={gameData.player2} isPlayer={isPlayer2} diceState={gameData.diceStates[1]} />
                   </div>
                 }
               </div>
               <div className="w-full bg-white p-6 rounded-lg shadow-lg">
-                <Controls web3={web3} accountAddress={accounts[0]} sendTransaction={sendTransaction} loggedIn={loggedIn} gameState={gameStateInWords} currentPlayer={gameData.currentBettor} isPlayer1={isPlayer1} isPlayer2={isPlayer2} isMyTurn={isMyTurn} />
+                <Controls web3={web3} accountAddress={accounts[0]} sendTransaction={sendTransaction} loggedIn={loggedIn} gameState={gameStateInWords} gameData={gameData} isPlayer1={isPlayer1} isPlayer2={isPlayer2} isMyTurn={isMyTurn} />
               </div>
             </>
           )}

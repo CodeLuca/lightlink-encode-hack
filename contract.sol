@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
+import "@api3/airnode-protocol/contracts/rrp/requesters/RrpRequesterV0.sol";
 
-contract DicePoker {
+contract DicePoker is RrpRequesterV0 {
     enum GameState {
         Joining,
         Player1Bet,
@@ -13,8 +14,18 @@ contract DicePoker {
         Player1RollDice,
         Player2RollDice,
         DetermineWinner,
+        Tie,
         GameEnded
     }
+    event RequestedUint256Array(bytes32 indexed requestId, uint256 size);
+    event WithdrawalRequested(address indexed airnode, address indexed sponsorWallet);
+
+    address public airnode;                 // The address of the QRNG Airnode
+    bytes32 public endpointIdUint256;       // The endpoint ID for requesting a single random number
+    bytes32 public endpointIdUint256Array;  // The endpoint ID for requesting an array of random numbers
+    address public sponsorWallet;           // The wallet that will cover the gas costs of the request
+
+    uint256[] public randomNumbers;
 
     GameState public currentState;
     address[2] public players;
@@ -31,6 +42,8 @@ contract DicePoker {
     address public player1;
     address public player2;
 
+    mapping(bytes32 => bool) public expectingRequestWithIdToBeFulfilled;
+
     modifier onlyOwner() {
         require(
             msg.sender == owner,
@@ -39,7 +52,7 @@ contract DicePoker {
         _;
     }
 
-    constructor() {
+    constructor(address _airnodeRrp) RrpRequesterV0(_airnodeRrp) {
         owner = msg.sender;
     }
 
@@ -48,16 +61,29 @@ contract DicePoker {
     event DiceRolled(address player, uint8[5] dice);
     event WinnerDeclared(address winner, uint256 payout);
 
-    function getQRNGNumber() private view returns (uint8[5] memory) {
-        uint8[5] memory result;
+      /// @notice Retrieves the dice states for both players.
+      /// @return dicePlayer1 The dice array for player 1.
+      /// @return dicePlayer2 The dice array for player 2.
+      function getPlayersDice() public view returns (uint8[5] memory dicePlayer1, uint8[5] memory dicePlayer2) {
+          dicePlayer1 = playerDice[0];
+          dicePlayer2 = playerDice[1];
+          return (dicePlayer1, dicePlayer2);
+      }
+
+    function getCallAmount() public view returns (uint256) {
+        require(gameStarted, "Game not started");
+        uint8 playerIndex = msg.sender == players[0] ? 0 : 1;
+
+        return currentBet - bets[playerIndex];
+    }
+        
+    function getAllDice() public view returns (uint8[10] memory) {
+        uint8[10] memory allDice;
         for (uint i = 0; i < 5; i++) {
-            result[i] = uint8(
-                (uint256(
-                    keccak256(abi.encodePacked(block.timestamp, msg.sender, i))
-                ) % 6) + 1
-            );
+            allDice[i] = playerDice[0][i];
+            allDice[i + 5] = playerDice[1][i];
         }
-        return result;
+        return allDice;
     }
 
     function joinGame() public {
@@ -91,91 +117,137 @@ contract DicePoker {
         }
     }
 
-    function placeBet(uint256 betAmount) public payable {
-        require(gameStarted, "Game not started");
-        require(
-            (currentState == GameState.Player1Bet &&
-                msg.sender == players[0]) ||
-                (currentState == GameState.Player2BetOrCall &&
-                    msg.sender == players[1]),
-            "Not your turn to bet"
-        );
-        require(msg.value == betAmount, "Sent ether does not match bet amount");
-        uint8 playerIndex = msg.sender == players[0] ? 0 : 1;
+      function placeBet(uint256 amount) public payable {
+          require(gameStarted, "Game not started");
+          require(msg.value == amount, "Sent ether does not match the input amount");
 
-        bets[playerIndex] += betAmount;
-        currentBet = betAmount; // Update the current bet amount
+          uint8 playerIndex = msg.sender == players[0] ? 0 : 1;
+          require(
+              (currentState == GameState.Joining && (playerIndex == 0 || playerIndex == 1)) ||
+              (currentState == GameState.Player1Bet && msg.sender == players[0]) ||
+              (currentState == GameState.Player2BetOrCall && msg.sender == players[1]) ||
+              (currentState == GameState.Player1RaiseOrCall && msg.sender == players[0]) ||
+              (currentState == GameState.Player2RaiseOrCall && msg.sender == players[1]),
+              "Not your turn"
+          );
 
-        emit BetPlaced(msg.sender, betAmount);
-        currentBettor = players[1 - playerIndex]; // Switch the current bettor
-        currentState = currentState == GameState.Player1Bet
-            ? GameState.Player2BetOrCall
-            : GameState.Player1RollDice;
-    }
+          if (currentState == GameState.Joining || currentState == GameState.Player1Bet) {
+              currentBet = amount;
+              currentState = (playerIndex == 0) ? GameState.Player2BetOrCall : GameState.Player1RaiseOrCall;
+          } else {
+              uint256 totalBet = bets[playerIndex] + msg.value;
+              require(totalBet >= currentBet, "Total bet must be at least equal to the current bet to call or raise");
+
+              if (totalBet > currentBet) {
+                  currentBet = totalBet;
+                  currentState = (playerIndex == 0) ? GameState.Player2RaiseOrCall : GameState.Player1RaiseOrCall;
+              } else if (totalBet == currentBet) {
+                  if (currentState == GameState.Player2BetOrCall || currentState == GameState.Player2RaiseOrCall) {
+                      currentState = GameState.Player1RollDice;
+                  } else if (currentState == GameState.Player1RaiseOrCall) {
+                      currentState = GameState.Player2RollDice;
+                  }
+              }
+          }
+
+          bets[playerIndex] += msg.value;
+          emit BetPlaced(msg.sender, msg.value);
+
+          if (bets[0] >= currentBet && bets[1] >= currentBet) {
+              currentState = determineNextPhase();
+          }
+      }
+
+      function determineNextPhase() private returns (GameState) {
+          if (!hasRolled[0] && !hasRolled[1]) {
+              return GameState.Player1RollDice;
+          } else if (hasRolled[0] && !hasRolled[1]) {
+              return GameState.Player2RollDice;
+          } else if (hasRolled[0] && hasRolled[1]) {
+              return GameState.DetermineWinner;
+          }
+          return GameState.Joining; // Fallback, should not reach here in a normal flow
+      }
+
 
     function raise(uint256 raiseAmount) public payable {
         require(gameStarted, "Game not started");
         require(
-            (currentState == GameState.Player1RaiseOrCall &&
-                msg.sender == players[0]) ||
-                (currentState == GameState.Player2RaiseOrCall &&
-                    msg.sender == players[1]),
+            (currentState == GameState.Player1Bet && msg.sender == players[0]) ||
+            (currentState == GameState.Player2BetOrCall && msg.sender == players[1]) ||
+            (currentState == GameState.Player1RaiseOrCall && msg.sender == players[0]) ||
+            (currentState == GameState.Player2RaiseOrCall && msg.sender == players[1]),
             "Not your turn to raise"
         );
-        require(
-            msg.value == raiseAmount,
-            "Sent ether does not match raise amount"
-        );
+
         uint8 playerIndex = msg.sender == players[0] ? 0 : 1;
+        // The raiseAmount includes the amount to call plus the additional raise
+        uint256 totalRequiredBet = currentBet - bets[playerIndex] + raiseAmount;
 
-        bets[playerIndex] += raiseAmount;
-        currentBet += raiseAmount; // Update the current bet amount
+        require(
+            msg.value == totalRequiredBet,
+            "Raise amount does not match the required total bet amount"
+        );
 
-        emit BetPlaced(msg.sender, raiseAmount);
-        currentBettor = players[1 - playerIndex]; // Switch the current bettor
-        currentState = currentState == GameState.Player1RaiseOrCall
-            ? GameState.Player2RaiseOrCall
-            : GameState.Player1RaiseOrCall;
+        bets[playerIndex] += msg.value;
+        currentBet += raiseAmount; // Increment the currentBet by the raiseAmount only
+
+        emit BetPlaced(msg.sender, msg.value);
+
+        // Advance the game state to the next appropriate state
+        currentState = (playerIndex == 0) ? GameState.Player2BetOrCall : GameState.Player1Bet;
     }
+
 
     function call() public payable {
         require(gameStarted, "Game not started");
         require(
-            (currentState == GameState.Player1RaiseOrCall &&
-                msg.sender == players[0]) ||
-                (currentState == GameState.Player2RaiseOrCall &&
-                    msg.sender == players[1]),
+            currentState == GameState.Player2BetOrCall && msg.sender == players[1] ||
+            currentState == GameState.Player1RaiseOrCall && msg.sender == players[0] ||
+            currentState == GameState.Player2RaiseOrCall && msg.sender == players[1],
             "Not your turn to call"
         );
+
         uint8 playerIndex = msg.sender == players[0] ? 0 : 1;
+        uint256 callAmount = currentBet - bets[playerIndex];
+
         require(
-            msg.value + bets[playerIndex] == currentBet,
-            "Sent ether does not match current bet"
+            msg.value == callAmount,
+            "Call amount does not match the required bet amount"
         );
 
         bets[playerIndex] += msg.value;
 
         emit BetPlaced(msg.sender, msg.value);
-        currentState = currentState == GameState.Player1RaiseOrCall
-            ? GameState.Player1RollDice
-            : GameState.Player2RollDice;
+
+        // Advance the game state
+        if (currentState == GameState.Player2BetOrCall || currentState == GameState.Player2RaiseOrCall) {
+            currentState = GameState.Player1RollDice;
+        } else if (currentState == GameState.Player1RaiseOrCall) {
+            currentState = GameState.Player2RollDice;
+        }
+
+        // Check if both players have placed their bets and are ready to roll the dice
+        if (bets[0] == bets[1] && currentState != GameState.Joining) {
+            currentState = GameState.Player1RollDice;
+        }
     }
 
     function fold() public {
         require(gameStarted, "Game not started");
         require(
-            (currentState == GameState.Player1RaiseOrCall &&
-                msg.sender == players[0]) ||
-                (currentState == GameState.Player2RaiseOrCall &&
-                    msg.sender == players[1]),
+            (currentState == GameState.Player1Bet && msg.sender == players[0]) ||
+            (currentState == GameState.Player2BetOrCall && msg.sender == players[1]) ||
+            (currentState == GameState.Player1RaiseOrCall && msg.sender == players[0]) ||
+            (currentState == GameState.Player2RaiseOrCall && msg.sender == players[1]),
             "Not your turn to fold"
         );
         uint8 playerIndex = msg.sender == players[0] ? 0 : 1;
 
-        currentState = playerIndex == 0
-            ? GameState.Player1Fold
-            : GameState.Player2Fold;
-        determineWinner();
+        // Assign the win to the other player
+        winner = players[1 - playerIndex];
+        emit WinnerDeclared(winner, address(this).balance);
+        payoutAndReset(); // Transfer the pot to the winner and reset the game
     }
 
     function rollDice(uint8[5] memory diceToRoll) public {
@@ -195,13 +267,24 @@ contract DicePoker {
                 "Dice value out of range"
             );
             if (diceToRoll[i] == 1) {
-                playerDice[playerIndex][i] = getQRNGNumber()[i];
+              uint256 randomNumber;
+              if (randomNumbers.length > 0) {
+                  // Take a random number from the global array  
+                  randomNumber = randomNumbers[randomNumbers.length - 1];
+                  randomNumbers.pop();
+              } else {
+                  // Generate a new random number using the current RNG method
+                  randomNumber = uint256(keccak256(abi.encodePacked(block.timestamp, msg.sender)));
+              }
+			  playerDice[playerIndex][i] = uint8(randomNumber);
+              replenishPool();
             }
         }
         hasRolled[playerIndex] = true;
         emit DiceRolled(msg.sender, playerDice[playerIndex]);
         roundNumber++;
         if (roundNumber == 2) {
+            currentState = GameState.DetermineWinner;
             determineWinner();
         } else {
             currentBettor = players[0]; // Reset the current bettor for the next betting round
@@ -223,14 +306,14 @@ contract DicePoker {
         } else if (currentState == GameState.Player2Fold) {
             winner = players[0];
         } else {
-            // Detailed logic to evaluate and compare the poker hands
-            winner = evaluateWinner();
+            address winningPlayer = evaluateWinner();
+            if (winningPlayer == address(0)) {
+                currentState = GameState.Tie; // Set state to Tie if there's no clear winner
+            } else {
+                winner = winningPlayer;
+            }
         }
-        uint256 payoutAmount = address(this).balance;
-        payable(winner).transfer(payoutAmount);
-        emit WinnerDeclared(winner, payoutAmount);
-        currentState = GameState.GameEnded;
-        resetGame();
+        payoutAndReset();
     }
 
     function countFrequencies(
@@ -306,12 +389,13 @@ contract DicePoker {
         return score;
     }
 
-    function resetGame() public onlyOwner {
-        require(
-            currentState == GameState.GameEnded,
-            "Cannot reset game at this stage"
-        );
-        currentBet = 0;
+    function resetGame() public {
+        // require(
+        //     currentState == GameState.GameEnded || currentState == GameState.Tie,
+        //     "Cannot reset game at this stage"
+        // );
+        // Reset game state to allow for a new game to start
+        currentState = GameState.Joining;
         delete players;
         delete bets;
         delete playerDice;
@@ -320,8 +404,9 @@ contract DicePoker {
             hasRerolled[i] = false;
         }
         gameStarted = false;
+        currentBet = 0;
+        winner = address(0);
         roundNumber = 0;
-        currentState = GameState.Joining;
     }
 
     function evaluateWinner() private returns (address) {
@@ -339,7 +424,116 @@ contract DicePoker {
         } else if (player2Score > player1Score) {
             return players[1];
         } else {
-            revert("It's a tie"); // It's a tie
+            return address(0); // It's a tie
         }
+    }
+
+    function payoutAndReset() private {
+        uint256 payoutAmount = address(this).balance;
+        if (currentState != GameState.Tie) {
+            payable(winner).transfer(payoutAmount);
+            emit WinnerDeclared(winner, payoutAmount);
+        } else {
+			// Assuming players[0] and players[1] are the addresses of the players
+			uint256 splitAmount = payoutAmount / 2;
+
+			// In case of an odd number of wei in the pot, add the remainder to the first player's split.
+			uint256 remainder = payoutAmount % 2;
+
+			if (players[0] != address(0)) {
+				payable(players[0]).transfer(splitAmount + remainder);
+			}
+			if (players[1] != address(0)) {
+				payable(players[1]).transfer(splitAmount);
+			}
+        }
+        resetGame();
+    }
+
+    // QRNG	
+    function replenishPool() public {
+        if (randomNumbers.length < 10) { // Replenish the pool if there are less than 10 random numbers left
+            getQRNGNumber(); // Use an arbitrary seed
+        }
+    }
+
+    function getQRNGNumber() public {
+        bytes32 requestId = airnodeRrp.makeFullRequest(
+            airnode,
+            endpointIdUint256Array, // Use the endpoint for requesting an array
+            address(this),
+            sponsorWallet,
+            address(this),
+            this.fulfillUint256Array.selector, // Use the fulfill function for an array
+            abi.encode(bytes32("1u"), bytes32("size"), 20) // Request an array of size 20
+        );
+        expectingRequestWithIdToBeFulfilled[requestId] = true;
+        emit RequestedUint256Array(requestId, 20);
+    }
+
+    /// @notice Sets the parameters for making requests
+    function setRequestParameters(
+        address _airnode,
+        bytes32 _endpointIdUint256,
+        bytes32 _endpointIdUint256Array,
+        address _sponsorWallet
+    ) external {
+        airnode = _airnode;
+        endpointIdUint256 = _endpointIdUint256;
+        endpointIdUint256Array = _endpointIdUint256Array;
+        sponsorWallet = _sponsorWallet;
+    }
+
+    /// @notice To receive funds from the sponsor wallet and send them to the owner.
+    receive() external payable {
+        payable(owner).transfer(msg.value);
+        emit WithdrawalRequested(airnode, sponsorWallet);
+    }
+
+
+    /// @notice Requests a `uint256[]`
+    /// @param size Size of the requested array
+    function makeRequestUint256Array(uint256 size) external {
+        bytes32 requestId = airnodeRrp.makeFullRequest(
+            airnode,
+            endpointIdUint256Array,
+            address(this),
+            sponsorWallet,
+            address(this),
+            this.fulfillUint256Array.selector,
+            // Using Airnode ABI to encode the parameters
+            abi.encode(bytes32("1u"), bytes32("size"), size)
+        );
+        expectingRequestWithIdToBeFulfilled[requestId] = true;
+        emit RequestedUint256Array(requestId, size);
+    }
+
+    /// @notice Called by the Airnode through the AirnodeRrp contract to
+    /// fulfill the request
+    function fulfillUint256Array(bytes32 requestId, bytes calldata data)
+        external
+        onlyAirnodeRrp
+    {
+        require(
+            expectingRequestWithIdToBeFulfilled[requestId],
+            "Request ID not known"
+        );
+        expectingRequestWithIdToBeFulfilled[requestId] = false;
+        uint256[] memory qrngUint256Array = abi.decode(data, (uint256[]));
+        
+        if (qrngUint256Array.length > 0) {
+            for (uint256 i = 0; i < qrngUint256Array.length; i++) {
+                uint8 adjustedRandomNumber = uint8(qrngUint256Array[i] % 6) + 1;
+                randomNumbers.push(adjustedRandomNumber);
+            }
+        }
+    }
+
+    /// @notice To withdraw funds from the sponsor wallet to the contract.
+    function withdraw() external onlyOwner {
+        airnodeRrp.requestWithdrawal(
+        airnode,
+        sponsorWallet
+        );
     }
 }

@@ -75,7 +75,8 @@ function LoginControl() {
     return (
       <div className="flex items-center justify-center h-screen">
         <div className="bg-white p-8 rounded shadow-md w-80">
-          <h2 className="text-2xl font-semibold mb-6 text-center">Login Moon Account</h2>
+          <h2 className="text-2xl font-semibold text-center">Login to access LightLink Dice Poker</h2>
+          <div className="text-center w-full mb-6 text-sm mt-2">You are logging into / creating a usemoon.ai custodial wallet</div>
           <form>
             <div className="mb-4">
               <label className="block text-gray-700">Email:</label>
