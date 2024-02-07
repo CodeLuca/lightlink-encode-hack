@@ -1,4 +1,4 @@
-# Dice Poker on Blockchain
+# LightLink Dice Poker
 
 ## Overview
 This project introduces a decentralized Dice Poker game, inspired by "The Witcher's" iconic gameplay, leveraging the cutting-edge features of blockchain technology. We've integrated LightLink's Layer 2 solutions for scalability, API3's Quantum Random Number Generator (QRNG) for true randomness, and Moon's innovative account abstraction for a simplified user experience. This blend of technologies ensures that each game is not only fair and transparent but also accessible to a wider audience beyond traditional blockchain enthusiasts.
