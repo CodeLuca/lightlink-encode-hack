@@ -40,7 +40,7 @@ const App = () => {
   const [error, setError] = useState(null);
   const [confirmed, setConfirmed] = useState(null);
 
-  const contractAddress = '0x186807C9aAC89237e75306aD80430395Cce4Ca25';
+  const contractAddress = '0xb605F160EC4f5F94e1A81268e5FdDbD704262bc6';
   const contractABI = abi;
   const { moon } = useMoonSDK();
   const web3 = new Web3(window.ethereum);
@@ -210,7 +210,7 @@ const App = () => {
     if ((Number(gS) === GameStateEnum.Player1RollDice && isPlayer1) || (Number(gS) === GameStateEnum.Player2RollDice && isPlayer2)) {
       setIsMyTurn(true);
     }
-    console.log(Number(gS), GameStateEnum.Player1RollDice)
+    console.log(Number(gS), GameStateEnum.Player1Bet, GameStateEnum.Player2BetOrCall, GameStateEnum.Player1RaiseOrCall, GameStateEnum.Player2RaiseOrCall, GameStateEnum.Player1RollDice, GameStateEnum.Player2RollDice, GameStateEnum.DetermineWinner, GameStateEnum.GameEnded);
     console.log(Number(gS), GameStateEnum.Player2RollDice)
     setGameData({
       currentBet, player2, player1, winner,

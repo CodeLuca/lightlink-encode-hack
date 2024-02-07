@@ -389,25 +389,34 @@ contract DicePoker is RrpRequesterV0 {
         return score;
     }
 
-    function resetGame() public {
-        // require(
-        //     currentState == GameState.GameEnded || currentState == GameState.Tie,
-        //     "Cannot reset game at this stage"
-        // );
-        // Reset game state to allow for a new game to start
+    function resetGame() public onlyOwner {
         currentState = GameState.Joining;
-        delete players;
-        delete bets;
-        delete playerDice;
-        for (uint i = 0; i < 2; i++) {
-            hasRolled[i] = false;
-            hasRerolled[i] = false;
+        delete players; // Clears the players array
+        for (uint256 i = 0; i < bets.length; i++) {
+            bets[i] = 0; // Resets all bets to 0
         }
-        gameStarted = false;
-        currentBet = 0;
-        winner = address(0);
-        roundNumber = 0;
+        for (uint256 i = 0; i < playerDice.length; i++) {
+            for (uint256 j = 0; j < playerDice[i].length; j++) {
+                playerDice[i][j] = 0; // Resets dice values to 0
+            }
+        }
+        for (uint256 i = 0; i < hasRolled.length; i++) {
+            hasRolled[i] = false; // Resets roll status for both players
+        }
+        for (uint256 i = 0; i < hasRerolled.length; i++) {
+            hasRerolled[i] = false; // Resets reroll status for both players
+        }
+        gameStarted = false; // Indicates the game is not started
+        currentBettor = address(0); // Resets current bettor
+        roundNumber = 0; // Resets the round number
+        winner = address(0); // Clears the winner
+        currentBet = 0; // Resets the current bet to 0
+        player1 = address(0); // Resets player 1 address
+        player2 = address(0); // Resets player 2 address
+        delete randomNumbers; // Clears the randomNumbers array
     }
+
+
 
     function evaluateWinner() private returns (address) {
         uint8[5] memory player1Dice = playerDice[0];
